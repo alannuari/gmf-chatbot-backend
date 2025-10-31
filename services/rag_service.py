@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
+from urllib.parse import quote
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_postgres import PGVector
 from sqlalchemy import create_engine, text
@@ -15,6 +15,7 @@ load_dotenv()
 os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
 os.environ["OPENAI_BASE_URL"] = os.getenv("OPENAI_BASE_URL")
 
+BASE_URL = os.getenv("BASE_URL")
 POSTGRES_USER = os.getenv("POSTGRES_USER")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD")
 POSTGRES_HOST = os.getenv("POSTGRES_HOST")
@@ -31,9 +32,20 @@ collection_name = os.getenv("COLLECTION_NAME")
 # Buat koneksi SQLAlchemy
 engine = create_engine(CONNECTION_STRING)
 
-def docs2str(docs):
-    return "\n\n".join(doc.page_content for doc in docs)
+error_messages = [
+    "Apologies, I don’t have that specific information in my Knowledge Base right now.",
+    "It seems that information hasn’t been added to the Knowledge Base yet. Please check back soon.",
+    "I couldn’t find any related information in the Knowledge Base. Please try rephrasing your question or asking it in another way."
+]
 
+# --- Helper: Ubah dokumen jadi string + metadata ---
+def docs2str(docs):
+    return "\n\n".join(
+        f"Source: {doc.metadata.get('source', 'Unknown')}\n{doc.page_content}"
+        for doc in docs
+    )
+
+# --- Buat RAG chain dan retriever ---
 def get_rag_chain():
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
@@ -61,19 +73,31 @@ def get_rag_chain():
         connection=engine,
     )
 
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 2})
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
 
     template = """
-    You are an intelligent assistant.
-    Answer the question based only on the following context:
+        You are a precise and literal assistant.
+        You MUST answer ONLY using information from the provided context.
     
-    Context: {context}
+        Instructions:
+        - First, detect the main language used in the context.
+        - ALWAYS respond in that same language, even if the question is in a different language.
+        - If the context is in English, your answer MUST be entirely in English.
+        - If the answer is not found in the context, respond with ONE of the following messages (choose one naturally):
+            1. "Apologies, I don’t have that specific information in my Knowledge Base right now."
+            2. "It seems that information hasn’t been added to the Knowledge Base yet. Please check back soon."
+            3. "I couldn’t find any related information in the Knowledge Base. Please try rephrasing your question or asking it in another way."
+        - Do NOT use external knowledge or translate the answer to another language.
 
-    Question: {question}
+        Context:
+        {context}
 
-    If the answer is not found in the context, say "I don't know based on the given context".
-    Answer clearly and concisely.
+        Question:
+        {question}
+
+        Answer (use the same language as the context):
     """
+
     prompt = ChatPromptTemplate.from_template(template)
 
     llm = ChatOpenAI(
@@ -81,16 +105,74 @@ def get_rag_chain():
         temperature=0.7
     )
 
-    chain = (
-        {"context": retriever | docs2str, "question": RunnablePassthrough()}
-        | prompt
-        | llm
-        | StrOutputParser()
-    )
+    chain = prompt | llm | StrOutputParser()
 
-    return chain
+    return retriever, chain
 
+def format_sources(docs):
+    sources_map = {}
+
+    for doc in docs:
+        path = doc.metadata.get("source")
+        page = doc.metadata.get("page")
+
+        if not path:
+            continue
+
+        filename = os.path.basename(path.rstrip("/"))
+        encoded_filename = quote(filename, safe="")
+
+        # Buat URL file
+        if path.startswith("http://") or path.startswith("https://"):
+            base_url = path
+        else:
+            base_url = f"{BASE_URL}/docs/{encoded_filename}"
+
+        # Jika file sudah pernah masuk, tambahkan halamannya
+        if path in sources_map:
+            if page and page not in sources_map[path]["pages"]:
+                sources_map[path]["pages"].append(page)
+        else:
+            sources_map[path] = {
+                "name": filename,
+                "source": base_url,
+                "pages": [page] if page else []
+            }
+
+    # Ubah ke list untuk output akhir
+    unique_sources = list(sources_map.values())
+
+    # Sort daftar halaman untuk rapi
+    for src in unique_sources:
+        src["pages"] = sorted([p for p in src["pages"] if p is not None])
+
+    return unique_sources
+
+# --- Fungsi utama untuk QA ---
 def ask_question(question: str):
-    chain = get_rag_chain()
-    response = chain.invoke(question)
-    return response
+    retriever, chain = get_rag_chain()
+
+    # Ambil dokumen terkait
+    docs = retriever.invoke(question)
+
+    # Gabungkan jadi konteks
+    context = docs2str(docs)
+
+    # Jalankan chain
+    response = chain.invoke({"context": context, "question": question})
+
+    # Format sumber jadi URL yang bisa diklik
+    sources = format_sources(docs)
+
+    # Pastikan ada jawaban
+    if not response.strip():
+        response = random.choice(error_messages)
+
+    # Jika LLM tidak tahu, kosongkan sources
+    if any(msg in response for msg in error_messages):
+        sources = []
+
+    return {
+        "answer": response,
+        "sources": sources
+    }

@@ -8,7 +8,8 @@ langchain_community
 langchain-huggingface
 langchain-postgres
 sentence_transformers
-pypdf  
+pypdf 
+PyMuPDF 
 docx2txt 
 python-multipart
 psycopg[binary]
